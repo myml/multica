@@ -598,7 +598,12 @@ func main() {
 		)
 		runtimeReconnectGrace = minimumRuntimeReconnectGrace
 	}
-	go runRuntimeSweeper(sweepCtx, pool, queries, liveness, taskSvc, bus, runtimeReconnectGrace)
+	// MULTICA_TASK_QUEUED_TTL lets self-hosted deployments that legitimately
+	// hold queued work behind long-running tasks — e.g. a runtime with low
+	// task concurrency — raise the built-in 2h queued expiry without losing
+	// work to queued_expired failures.
+	go runRuntimeSweeper(sweepCtx, pool, queries, liveness, taskSvc, bus, runtimeReconnectGrace,
+		envDuration("MULTICA_TASK_QUEUED_TTL", defaultTaskQueuedTTL))
 	go heartbeatScheduler.Run(sweepCtx)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
 	if autopilotSvc.QuotaEnabled() {
@@ -661,8 +666,13 @@ func main() {
 	if err := schedulerMgr.Register(scheduler.AutopilotScheduleDispatchJob(pool, queries, autopilotSvc)); err != nil {
 		slog.Warn("scheduler: failed to register autopilot_schedule_dispatch job", "error", err)
 	}
-if err := schedulerMgr.Register(scheduler.SkillUsageProcessorJob(pool, queries)); err != nil {
+	if err := schedulerMgr.Register(scheduler.SkillUsageProcessorJob(pool, queries)); err != nil {
 		slog.Warn("scheduler: failed to register skill_usage_processor job", "error", err)
+	}
+	// Manifest-declared Plugin schedules share the same durable lease and retry
+	// machinery. The job is inert while plugins_v1 is disabled.
+	if err := schedulerMgr.Register(scheduler.PluginHookScheduleDispatchJob(queries, h.PluginService)); err != nil {
+		slog.Warn("scheduler: failed to register plugin_hook_schedule_dispatch job", "error", err)
 	}
 	go func() {
 		_ = schedulerMgr.Run(sweepCtx)

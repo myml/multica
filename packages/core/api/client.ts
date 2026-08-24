@@ -151,6 +151,9 @@ import type {
   PluginHookResult,
   PluginInstallation,
   PluginInstallationListResponse,
+  PluginPackage,
+  PluginPackageListResponse,
+  PluginSurfaceLaunch,
   PluginInvocation,
   PluginMCPTool,
   PluginPreview,
@@ -208,6 +211,10 @@ import type {
   CreateWorkspaceSubscriptionCheckoutRequest,
   CreateWorkspaceSubscriptionCheckoutResponse,
   WorkspaceSubscriptionSeatReconcileResult,
+  PreviewWorkspaceSeatPurchaseRequest,
+  WorkspaceSeatPurchasePreview,
+  PurchaseWorkspaceSeatsRequest,
+  PurchaseWorkspaceSeatsResponse,
   CreateWorkspaceSubscriptionPortalResponse,
 } from "../types";
 import type { OnboardingCompletionPath } from "../onboarding/types";
@@ -319,6 +326,8 @@ import {
   WorkspaceSubscriptionPricesSchema,
   CreateWorkspaceSubscriptionCheckoutResponseSchema,
   WorkspaceSubscriptionSeatReconcileResultSchema,
+  WorkspaceSeatPurchasePreviewSchema,
+  PurchaseWorkspaceSeatsResponseSchema,
   CreateWorkspaceSubscriptionPortalResponseSchema,
   DingTalkInstallationSchema,
   ListDingTalkInstallationsResponseSchema,
@@ -401,8 +410,14 @@ import {
   EMPTY_WORKSPACE_MCP_SERVER,
   EMPTY_PLUGIN_INSTALLATION_LIST,
   EMPTY_PLUGIN_PREVIEW,
+  EMPTY_PLUGIN_PACKAGE,
+  EMPTY_PLUGIN_PACKAGE_LIST,
+  EMPTY_PLUGIN_SURFACE_LAUNCH,
   PluginHookResultSchema,
   PluginInstallationListResponseSchema,
+  PluginPackageListResponseSchema,
+  PluginPackageSchema,
+  PluginSurfaceLaunchSchema,
   PluginInvocationListSchema,
   PluginMCPToolListSchema,
   PluginTokenIssueSchema,
@@ -1765,6 +1780,56 @@ export class ApiClient {
     );
   }
 
+  async previewWorkspaceSeatPurchase(
+    data: PreviewWorkspaceSeatPurchaseRequest,
+  ): Promise<WorkspaceSeatPurchasePreview | null> {
+    const res = await this.fetchRaw(
+      "/api/cloud-subscriptions/seats/purchase-preview",
+      {
+        method: "POST",
+        body: JSON.stringify({ additional_seats: data.additionalSeats }),
+        extraHeaders: { "Content-Type": "application/json" },
+      },
+    );
+    const raw = (await res.json()) as unknown;
+    return parseWithFallback<WorkspaceSeatPurchasePreview | null>(
+      raw,
+      WorkspaceSeatPurchasePreviewSchema,
+      null,
+      { endpoint: "POST /api/cloud-subscriptions/seats/purchase-preview" },
+    );
+  }
+
+  async purchaseWorkspaceSeats(
+    data: PurchaseWorkspaceSeatsRequest,
+  ): Promise<PurchaseWorkspaceSeatsResponse | null> {
+    const res = await this.fetchRaw(
+      "/api/cloud-subscriptions/seats/purchases",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          additional_seats: data.additionalSeats,
+          expected_current_seats: data.expectedCurrentSeats,
+          expected_purchase_version: data.expectedPurchaseVersion,
+          accepted_proration_amount: data.acceptedProrationAmount,
+          currency: data.currency,
+          idempotency_key: data.idempotencyKey,
+        }),
+        extraHeaders: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": data.idempotencyKey,
+        },
+      },
+    );
+    const raw = (await res.json()) as unknown;
+    return parseWithFallback<PurchaseWorkspaceSeatsResponse | null>(
+      raw,
+      PurchaseWorkspaceSeatsResponseSchema,
+      null,
+      { endpoint: "POST /api/cloud-subscriptions/seats/purchases" },
+    );
+  }
+
   async createWorkspaceSubscriptionPortal(
     idempotencyKey: string,
   ): Promise<CreateWorkspaceSubscriptionPortalResponse | null> {
@@ -2483,6 +2548,71 @@ export class ApiClient {
     });
   }
 
+  /** Everything published into this workspace, with its versions. */
+  async listPluginPackages(workspaceId: string): Promise<PluginPackageListResponse> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/packages`);
+    return parseWithFallback(raw, PluginPackageListResponseSchema, EMPTY_PLUGIN_PACKAGE_LIST, {
+      endpoint: "GET /api/workspaces/{id}/plugins/packages",
+    });
+  }
+
+  /**
+   * Publishes an artifact bundle: a zip holding the manifest and every file it
+   * names. This is the whole publishing path — a plugin author needs no server
+   * of their own, and nothing about a published version changes afterwards.
+   *
+   * Not routed through `this.fetch`, for the same reason uploadFile is not: the
+   * browser has to set the multipart boundary itself.
+   */
+  async publishPluginPackage(workspaceId: string, bundle: File): Promise<PluginPackage> {
+    const formData = new FormData();
+    formData.append("bundle", bundle);
+
+    const res = await fetch(`${this.baseUrl}/api/workspaces/${workspaceId}/plugins/packages`, {
+      method: "POST",
+      headers: this.authHeaders(),
+      body: formData,
+      credentials: "include",
+    });
+    if (!res.ok) {
+      if (res.status === 401) this.handleUnauthorized();
+      throw new Error(await this.parseErrorMessage(res, `Publishing failed: ${res.status}`));
+    }
+    const raw = (await res.json()) as unknown;
+    return parseWithFallback(raw, PluginPackageSchema, EMPTY_PLUGIN_PACKAGE, {
+      endpoint: "POST /api/workspaces/{id}/plugins/packages",
+    });
+  }
+
+  /**
+   * Publishes from a directory the operator hosts (MULTICA_PLUGIN_DIR) — the
+   * development channel, so iterating on a surface does not mean zipping and
+   * uploading after every edit. It still produces an immutable version.
+   */
+  async publishLocalPluginPackage(workspaceId: string, name: string): Promise<PluginPackage> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/packages/local`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    return parseWithFallback(raw, PluginPackageSchema, EMPTY_PLUGIN_PACKAGE, {
+      endpoint: "POST /api/workspaces/{id}/plugins/packages/local",
+    });
+  }
+
+  async deletePluginPackage(workspaceId: string, packageId: string): Promise<void> {
+    await this.fetch<void>(`/api/workspaces/${workspaceId}/plugins/packages/${packageId}`, { method: "DELETE" });
+  }
+
+  /** Mint one hosted document URL and its single-use bridge proof. */
+  async getPluginSurfaceLaunch(workspaceId: string, installationId: string, surfaceKey: string): Promise<PluginSurfaceLaunch> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/plugins/${installationId}/surfaces/${encodeURIComponent(surfaceKey)}/launch`,
+    );
+    return parseWithFallback(raw, PluginSurfaceLaunchSchema, EMPTY_PLUGIN_SURFACE_LAUNCH, {
+      endpoint: "GET /api/workspaces/{id}/plugins/{installationId}/surfaces/{surfaceKey}/launch",
+    });
+  }
+
   /**
    * Step one of the two-step install. Nothing is written: the response is what
    * the consent screen shows before an installation exists.
@@ -2542,7 +2672,7 @@ export class ApiClient {
     const query = request.path === "/context" && request.issueId
       ? `?issue_id=${encodeURIComponent(request.issueId)}`
       : "";
-    return this.fetch<unknown>(`/api/v1/plugin${request.path}${query}`, {
+    return this.fetch<unknown>(`/api/plugin-bridge/v1${request.path}${query}`, {
       method: request.method,
       headers: { "X-Multica-Plugin-Installation": installationId },
       body: request.body === undefined ? undefined : JSON.stringify(request.body),
@@ -2563,7 +2693,7 @@ export class ApiClient {
     hookKey: string,
     request: { trigger: "ui" | "manual"; issueId?: string; input?: unknown },
   ): Promise<PluginHookResult> {
-    const raw = await this.fetch<unknown>(`/api/v1/plugin/hooks/${encodeURIComponent(hookKey)}`, {
+    const raw = await this.fetch<unknown>(`/api/plugin-bridge/v1/hooks/${encodeURIComponent(hookKey)}`, {
       method: "POST",
       headers: { "X-Multica-Plugin-Installation": installationId },
       body: JSON.stringify({ trigger: request.trigger, issue_id: request.issueId, input: request.input }),
@@ -2574,7 +2704,7 @@ export class ApiClient {
       trigger: request.trigger,
       latency_ms: 0,
       attempts: 1,
-    }, { endpoint: "POST /api/v1/plugin/hooks/{key}" });
+    }, { endpoint: "POST /api/plugin-bridge/v1/hooks/{key}" });
   }
 
   async listPluginInvocations(workspaceId: string, installationId: string): Promise<PluginInvocation[]> {
